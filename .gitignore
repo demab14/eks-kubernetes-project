@@ -1,0 +1,6 @@
+*.zip
+*.tar.gz
+node_modules/
+.env
+iam-policy.json
+cwagentconfig.json

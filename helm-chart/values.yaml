@@ -1,0 +1,15 @@
+replicaCount: 1
+image:
+  repository: demab/eks-app
+  tag: "1.0"
+  pullPolicy: IfNotPresent
+service:
+  type: LoadBalancer
+  port: 80
+resources:
+  requests:
+    cpu: 300m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

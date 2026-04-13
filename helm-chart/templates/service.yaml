@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: eks-project
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: eks-project
+  ports:
+  - port: {{ .Values.service.port }}
+    targetPort: 80
