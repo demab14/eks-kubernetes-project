@@ -36,8 +36,10 @@ Workflow: [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)
 
 | Trigger | Jobs that run |
 |---|---|
-| Pull request to `main` | `validate` only |
-| Push to `main` / manual run | `validate` → `deploy` |
+| Pull request or push to `main` | `validate` only |
+| Manual run (**Actions → Run workflow**) | `validate` → `deploy` |
+
+Deploys are manual on purpose. The cluster is only running while I'm demoing or testing, so automatic deploys on every push would fail whenever it's switched off.
 
 **`validate`**
 - `helm lint` on the chart
@@ -100,7 +102,7 @@ Because each pod requests 300m CPU, the HPA adds pods once average usage goes ab
 - **Scale in:** when load drops, the HPA waits for its stabilisation window (5 minutes by default) before removing pods, which prevents flapping.
 
 ### Prerequisite: metrics-server
-The HPA reads CPU from the Kubernetes Metrics API, so metrics-server must be installed:
+The HPA reads CPU from the Kubernetes Metrics API, so metrics-server must be installed. Recent `eksctl` versions install it automatically as an EKS add-on. To install it by hand:
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 kubectl top pods   # should return CPU/memory, not an error
@@ -123,15 +125,70 @@ What to expect:
 2. `REPLICAS` increases step by step towards 5 (`kubectl get pods -w` shows new pods starting).
 3. After siege stops, CPU falls, and after the stabilisation window replicas scale back down to 1.
 
-### Results
-<!-- Add screenshots from your own load test run -->
-| Before load | During load | After cool-down |
+## Results (live run, October 2026)
+
+### 1. Pipeline: build → push → deploy in 45 seconds
+A manual run of the workflow passed every step end to end:
+```
+✓ Lint and validate manifests in 15s
+✓ Build, push and deploy in 45s
+  ✓ Log in to Docker Hub
+  ✓ Build and push image
+  ✓ Configure AWS credentials (OIDC, no static keys)
+  ✓ Update kubeconfig
+  ✓ Deploy with Helm
+  ✓ Apply Horizontal Pod Autoscaler
+  ✓ Verify rollout
+✓ Run Build and Deploy to EKS completed with 'success'
+```
+
+### 2. Running in the cluster
+```
+$ kubectl get pods,svc,hpa
+pod/eks-project-5dd6f98d4c-vg6x8   1/1   Running
+
+service/eks-project   LoadBalancer   ...   <elb-hostname>.eu-west-2.elb.amazonaws.com   80:30328/TCP
+
+horizontalpodautoscaler.autoscaling/eks-hpa   Deployment/eks-project   cpu: 0%/50%   1   5   1
+```
+The HPA reports real CPU figures (`0%/50%` rather than `<unknown>`), which confirms metrics-server is feeding it.
+
+### 3. Autoscaling under load
+
+**Before load:** 1 replica, CPU at 0%.
+```
+NAME      REFERENCE                TARGETS       MINPODS   MAXPODS   REPLICAS
+eks-hpa   Deployment/eks-project   cpu: 0%/50%   1         5         1
+```
+
+**During load:** the HPA saw CPU go above the 50% target and **added a second pod automatically**:
+```
+NAME                           READY   STATUS    RESTARTS   AGE
+eks-project-5dd6f98d4c-vg6x8   1/1     Running   0          11m
+eks-project-5dd6f98d4c-vwgbl   1/1     Running   0          116s   ← created by the HPA
+
+NAME      REFERENCE                TARGETS        MINPODS   MAXPODS   REPLICAS
+eks-hpa   Deployment/eks-project   cpu: 19%/50%   1         5         2
+```
+With the traffic split across 2 pods, CPU per pod settled at about 10–25%, below the target. So the HPA held at 2 replicas and didn't over-provision.
+
+**After load:** once the load stopped, the HPA waited for its 5-minute stabilisation window and then scaled back down to 1 replica.
+
+### What I learned from the load test
+- **External load testing was network-bound.** Running `siege` from my laptop only got pod CPU to about 9% and then hit connection timeouts. My own connection was the bottleneck, not the cluster.
+- **In-cluster load isolates the app.** I generated traffic from busybox pods inside the cluster instead:
+  ```bash
+  kubectl create deployment load-generator --image=busybox --replicas=10 \
+    -- /bin/sh -c "while true; do wget -q -O- http://eks-project > /dev/null; done"
+  ```
+  This pushed CPU over the threshold and triggered the scale-out.
+- **Static nginx is cheap to serve.** Increasing the load generators from 10 to 25 didn't raise CPU further, because each busybox `wget` loop sends only one request at a time. Scaling up to the 5-replica maximum would need a heavier load tool (for example `hey` or `k6`) or a more CPU-intensive app.
+
+<!-- Optional: add screenshots to docs/ and uncomment
+| Before | During | After |
 |---|---|---|
 | ![](docs/hpa-before.png) | ![](docs/hpa-during.png) | ![](docs/hpa-after.png) |
-
-CloudWatch Container Insights view of the same test:
-
-![](docs/cloudwatch-cpu.png)
+-->
 
 ## Monitoring
 CloudWatch Container Insights collects CPU, memory, network and pod-count metrics for the cluster, nodes and pods. Use it alongside `kubectl get hpa` to confirm that scaling decisions line up with actual resource usage.
